@@ -10,6 +10,7 @@ import traceback
 import pandas as pd
 
 from scripts.data_queries_engine import run_data_queries
+from scripts.data_queries_feedback_correction import apply_feedback_corrections_ai_agent
 from scripts.unified_cooler_pos_queries import run_unified_cooler_pos_queries
 from scripts.unified_cooler_pos_feedback_correction import apply_unified_feedback_corrections
 
@@ -89,6 +90,40 @@ def package_generated_outputs(
     return output_file_path, output_file_path.name
 
 
+def package_specific_files(
+    run_output_dir: Path,
+    files: list,
+    project: str,
+    action: str,
+    month: str,
+    year: str,
+    batch: str,
+):
+    existing_files = [
+        Path(file_path)
+        for file_path in files
+        if file_path and Path(file_path).exists()
+    ]
+
+    if not existing_files:
+        raise RuntimeError("The script completed but did not return any existing output files.")
+
+    if len(existing_files) > 1:
+        output_file_name = (
+            f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Outputs.zip"
+        )
+        output_file_path = run_output_dir / output_file_name
+
+        with zipfile.ZipFile(output_file_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in existing_files:
+                zip_file.write(file_path, arcname=file_path.name)
+
+        return output_file_path, output_file_name
+
+    output_file_path = existing_files[0]
+    return output_file_path, output_file_path.name
+
+
 @app.post("/api/runs")
 async def create_run(
     query_family: str = Form(...),
@@ -133,6 +168,27 @@ async def create_run(
             output_file_path, output_file_name = package_generated_outputs(
                 run_output_dir=run_output_dir,
                 before_files=before_files,
+                project=project,
+                action=action,
+                month=month,
+                year=year,
+                batch=batch,
+            )
+
+        elif query_family == "Data Queries" and action == "Correct Feedback":
+            if not feedback_file_path:
+                raise RuntimeError("Feedback workbook is required for Data Queries feedback correction.")
+
+            corrected_data_file, corrected_feedback_file = apply_feedback_corrections_ai_agent(
+                project_name=project,
+                data_path=str(data_file_path),
+                feedback_path=str(feedback_file_path),
+                output_dir=str(run_output_dir),
+            )
+
+            output_file_path, output_file_name = package_specific_files(
+                run_output_dir=run_output_dir,
+                files=[corrected_data_file, corrected_feedback_file],
                 project=project,
                 action=action,
                 month=month,
