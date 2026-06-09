@@ -6,9 +6,11 @@ from datetime import datetime
 import shutil
 import uuid
 import zipfile
+import traceback
 import pandas as pd
 
 from scripts.data_queries_engine import run_data_queries
+from scripts.unified_cooler_pos_queries import run_unified_cooler_pos_queries
 
 
 app = FastAPI(title="Retail Audit Automation Backend")
@@ -39,6 +41,52 @@ def health_check():
         "status": "ok",
         "service": "Retail Audit Automation Backend",
     }
+
+
+def package_generated_outputs(
+    run_output_dir: Path,
+    before_files: set,
+    project: str,
+    action: str,
+    month: str,
+    year: str,
+    batch: str,
+):
+    after_files = set(run_output_dir.glob("*"))
+
+    new_files = sorted(
+        [path for path in list(after_files - before_files) if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    if not new_files:
+        raise RuntimeError("The script completed but did not generate an output file.")
+
+    excel_files = [
+        path
+        for path in new_files
+        if path.suffix.lower() in [".xlsx", ".xlsm", ".xls"]
+    ]
+
+    if len(excel_files) > 1:
+        output_file_name = (
+            f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Outputs.zip"
+        )
+        output_file_path = run_output_dir / output_file_name
+
+        with zipfile.ZipFile(output_file_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in excel_files:
+                zip_file.write(file_path, arcname=file_path.name)
+
+        return output_file_path, output_file_name
+
+    if len(excel_files) == 1:
+        output_file_path = excel_files[0]
+        return output_file_path, output_file_path.name
+
+    output_file_path = new_files[0]
+    return output_file_path, output_file_path.name
 
 
 @app.post("/api/runs")
@@ -82,46 +130,38 @@ async def create_run(
                 prev_feedback_path=str(feedback_file_path) if feedback_file_path else None,
             )
 
-            after_files = set(run_output_dir.glob("*"))
-            new_files = sorted(
-                [path for path in list(after_files - before_files) if path.is_file()],
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
+            output_file_path, output_file_name = package_generated_outputs(
+                run_output_dir=run_output_dir,
+                before_files=before_files,
+                project=project,
+                action=action,
+                month=month,
+                year=year,
+                batch=batch,
             )
 
-            if not new_files:
-                raise RuntimeError(
-                    "The data queries script completed but did not generate an output file."
-                )
+        elif query_family == "POS and Cooler Queries" and action == "Run Queries":
+            before_files = set(run_output_dir.glob("*"))
 
-            excel_files = [
-                path
-                for path in new_files
-                if path.suffix.lower() in [".xlsx", ".xlsm", ".xls"]
-            ]
+            run_unified_cooler_pos_queries(
+                project_name=project,
+                input_file=str(data_file_path),
+                output_dir=str(run_output_dir),
+            )
 
-            if len(excel_files) > 1:
-                output_file_name = (
-                    f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Outputs.zip"
-                )
-                output_file_path = run_output_dir / output_file_name
-
-                with zipfile.ZipFile(output_file_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                    for file_path in excel_files:
-                        zip_file.write(file_path, arcname=file_path.name)
-
-            elif len(excel_files) == 1:
-                output_file_path = excel_files[0]
-                output_file_name = output_file_path.name
-
-            else:
-                output_file_path = new_files[0]
-                output_file_name = output_file_path.name
+            output_file_path, output_file_name = package_generated_outputs(
+                run_output_dir=run_output_dir,
+                before_files=before_files,
+                project=project,
+                action=action,
+                month=month,
+                year=year,
+                batch=batch,
+            )
 
         else:
             # Temporary dummy output for other actions.
-            # Later we will connect Correct Feedback, Merge Feedback,
-            # and POS & Cooler workflows here.
+            # Later we will connect Correct Feedback and Merge Feedback here.
             output_file_name = (
                 f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Output.xlsx"
             )
@@ -148,6 +188,9 @@ async def create_run(
             summary_df.to_excel(output_file_path, index=False)
 
     except Exception as exc:
+        print("❌ RUN FAILED")
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=500,
             detail=f"Run failed: {str(exc)}",
