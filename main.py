@@ -1,11 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pathlib import Path
 from datetime import datetime
 import shutil
 import uuid
+import zipfile
 import pandas as pd
+
+from scripts.data_queries_engine import run_data_queries
+
 
 app = FastAPI(title="Retail Audit Automation Backend")
 
@@ -67,30 +71,87 @@ async def create_run(
         with feedback_file_path.open("wb") as buffer:
             shutil.copyfileobj(feedback_file.file, buffer)
 
-    # Dummy output for now.
-    # Later this is where we will call the real Python scripts.
-    output_file_name = f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Output.xlsx"
-    output_file_path = run_output_dir / output_file_name
+    try:
+        if query_family == "Data Queries" and action == "Run Queries":
+            before_files = set(run_output_dir.glob("*"))
 
-    summary_df = pd.DataFrame(
-        [
-            {
-                "Run ID": run_id,
-                "Query Family": query_family,
-                "Project": project,
-                "Action": action,
-                "Month": month,
-                "Year": year,
-                "Batch": batch,
-                "Data File": data_file.filename,
-                "Feedback File": feedback_file.filename if feedback_file else "",
-                "Status": "Success",
-                "Created At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        ]
-    )
+            run_data_queries(
+                project_name=project,
+                data_path=str(data_file_path),
+                output_dir=str(run_output_dir),
+                prev_feedback_path=str(feedback_file_path) if feedback_file_path else None,
+            )
 
-    summary_df.to_excel(output_file_path, index=False)
+            after_files = set(run_output_dir.glob("*"))
+            new_files = sorted(
+                [path for path in list(after_files - before_files) if path.is_file()],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+
+            if not new_files:
+                raise RuntimeError(
+                    "The data queries script completed but did not generate an output file."
+                )
+
+            excel_files = [
+                path
+                for path in new_files
+                if path.suffix.lower() in [".xlsx", ".xlsm", ".xls"]
+            ]
+
+            if len(excel_files) > 1:
+                output_file_name = (
+                    f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Outputs.zip"
+                )
+                output_file_path = run_output_dir / output_file_name
+
+                with zipfile.ZipFile(output_file_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    for file_path in excel_files:
+                        zip_file.write(file_path, arcname=file_path.name)
+
+            elif len(excel_files) == 1:
+                output_file_path = excel_files[0]
+                output_file_name = output_file_path.name
+
+            else:
+                output_file_path = new_files[0]
+                output_file_name = output_file_path.name
+
+        else:
+            # Temporary dummy output for other actions.
+            # Later we will connect Correct Feedback, Merge Feedback,
+            # and POS & Cooler workflows here.
+            output_file_name = (
+                f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Output.xlsx"
+            )
+            output_file_path = run_output_dir / output_file_name
+
+            summary_df = pd.DataFrame(
+                [
+                    {
+                        "Run ID": run_id,
+                        "Query Family": query_family,
+                        "Project": project,
+                        "Action": action,
+                        "Month": month,
+                        "Year": year,
+                        "Batch": batch,
+                        "Data File": data_file.filename,
+                        "Feedback File": feedback_file.filename if feedback_file else "",
+                        "Status": "Success",
+                        "Created At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                ]
+            )
+
+            summary_df.to_excel(output_file_path, index=False)
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Run failed: {str(exc)}",
+        )
 
     return {
         "run_id": run_id,
@@ -106,23 +167,34 @@ def download_output(run_id: str):
     run_output_dir = OUTPUT_DIR / run_id
 
     if not run_output_dir.exists():
-        return {
-            "status": "error",
-            "message": "Output folder not found.",
-        }
+        raise HTTPException(
+            status_code=404,
+            detail="Output folder not found.",
+        )
 
-    output_files = list(run_output_dir.glob("*.xlsx"))
+    output_files = list(run_output_dir.glob("*.zip"))
 
     if not output_files:
-        return {
-            "status": "error",
-            "message": "No output file found for this run.",
-        }
+        output_files = list(run_output_dir.glob("*.xlsx"))
 
-    output_file = output_files[0]
+    if not output_files:
+        raise HTTPException(
+            status_code=404,
+            detail="No output file found for this run.",
+        )
+
+    output_file = sorted(
+        output_files,
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[0]
 
     return FileResponse(
         path=output_file,
         filename=output_file.name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=(
+            "application/zip"
+            if output_file.suffix.lower() == ".zip"
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
     )
