@@ -11,11 +11,11 @@ import pandas as pd
 
 from scripts.data_queries_engine import run_data_queries
 from scripts.unified_cooler_pos_queries import run_unified_cooler_pos_queries
+from scripts.unified_cooler_pos_feedback_correction import apply_unified_feedback_corrections
 
 
 app = FastAPI(title="Retail Audit Automation Backend")
 
-# Frontend dev + deployed frontend URLs
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -159,9 +159,34 @@ async def create_run(
                 batch=batch,
             )
 
+        elif query_family == "POS and Cooler Queries" and action == "Correct Feedback":
+            if not feedback_file_path:
+                raise RuntimeError("Feedback workbook is required for POS and Cooler feedback correction.")
+
+            before_files = set(run_output_dir.glob("*"))
+
+            corrected_file = apply_unified_feedback_corrections(
+                project_name=project,
+                data_path=str(data_file_path),
+                feedback_path=str(feedback_file_path),
+                output_dir=str(run_output_dir),
+            )
+
+            if corrected_file:
+                output_file_path = Path(corrected_file)
+                output_file_name = output_file_path.name
+            else:
+                output_file_path, output_file_name = package_generated_outputs(
+                    run_output_dir=run_output_dir,
+                    before_files=before_files,
+                    project=project,
+                    action=action,
+                    month=month,
+                    year=year,
+                    batch=batch,
+                )
+
         else:
-            # Temporary dummy output for other actions.
-            # Later we will connect Correct Feedback and Merge Feedback here.
             output_file_name = (
                 f"{project}-{action.replace(' ', '-')}-{month}{year}-Batch{batch}-Output.xlsx"
             )
