@@ -153,27 +153,56 @@ def calculate_sales(df_list, all_months, resolved, columns_to_check):
     valid = s[s['Previous_Stock'].notna()].copy()
     sales_dict = valid.set_index('Comb_stock')['Sales'].to_dict()
     neg_rows = []
-    for _, row in valid[valid['Sales'] < 0].iterrows():
-        comb = row['Comb_stock']
-        for df_m in reversed(df_list):
-            df_m['Comb_stock'] = df_m[oid_col].astype(str) + df_m[sku_col].astype(str)
-            match = df_m[df_m['Comb_stock'] == comb]
-            if not match.empty:
-                rec = match.iloc[0].to_dict()
-                rec['Comb'] = rec['Comb_stock'] = str(comb)
-                rec['Sales'] = row['Sales']
-                rec['Queries'] = 'Negative sales'
-                rec['Combination'] = 'Sales'
-                for col in columns_to_check:
-                    ac = resolve_col(df_m, col)
-                    if ac:
-                        for mo, dm in zip(all_months, df_list):
-                            dm['Comb_stock'] = dm[oid_col].astype(str)+dm[sku_col].astype(str)
-                            mm = dm[dm['Comb_stock']==comb]
-                            if not mm.empty and ac in mm.columns:
-                                rec[f"{col} ({mo})"] = mm.iloc[0][ac]
-                neg_rows.append(rec)
-                break
+    if not valid[valid['Sales'] < 0].empty:
+        # Build per-sheet lookup once (vectorized) instead of scanning sheets per row
+        sheet_lookups = []
+        for mo, df_m in zip(all_months, df_list):
+            if oid_col not in df_m.columns or sku_col not in df_m.columns:
+                continue
+            tmp = df_m.copy()
+            tmp['Comb_stock'] = tmp[oid_col].astype(str) + tmp[sku_col].astype(str)
+            tmp['_month'] = mo
+            sheet_lookups.append(tmp)
+
+        # For each metric, build month-value lookup
+        col_mo_lookup = {}
+        for col in columns_to_check:
+            col_mo_lookup[col] = {}
+            for mo, df_m in zip(all_months, df_list):
+                ac = resolve_col(df_m, col)
+                if not ac or ac not in df_m.columns:
+                    continue
+                tmp = df_m.copy()
+                tmp['Comb_stock'] = tmp[oid_col].astype(str) + tmp[sku_col].astype(str)
+                tmp = tmp.drop_duplicates('Comb_stock')
+                col_mo_lookup[col][mo] = tmp.set_index('Comb_stock')[ac].to_dict()
+
+        # Build comb -> first matching row lookup across all sheets
+        all_sheet_data = pd.concat(sheet_lookups, ignore_index=True) if sheet_lookups else pd.DataFrame()
+        if not all_sheet_data.empty:
+            comb_row_lookup = (all_sheet_data
+                               .drop_duplicates('Comb_stock', keep='last')
+                               .set_index('Comb_stock')
+                               .to_dict(orient='index'))
+        else:
+            comb_row_lookup = {}
+
+        for _, row in valid[valid['Sales'] < 0].iterrows():
+            comb = row['Comb_stock']
+            rec = comb_row_lookup.get(comb)
+            if rec is None:
+                continue
+            rec = dict(rec)
+            rec['Comb'] = rec['Comb_stock'] = str(comb)
+            rec['Sales'] = row['Sales']
+            rec['Queries'] = 'Negative sales'
+            rec['Combination'] = 'Sales'
+            for col in columns_to_check:
+                for mo, val_dict in col_mo_lookup.get(col, {}).items():
+                    val = val_dict.get(comb)
+                    if val is not None:
+                        rec[f'{col} ({mo})'] = val
+            neg_rows.append(rec)
     print(f"   Negative Sales: {len(neg_rows)} flagged")
     return neg_rows, sales_dict
 
@@ -404,6 +433,33 @@ def _is_new_baseline(curr_val, prev_val, hist_vals, metric_name):
               f"(avg was {hm:.0f}, became {prev_val:.0f} last month, now {curr_val:.0f})")
     return True, reason
 
+def _build_metric_pivot(df_list, all_months, oc, sc, cols):
+    """
+    Build a dict: metric_col -> DataFrame indexed by comb_key with one column per month.
+    Uses vectorized concat+pivot instead of iterrows — dramatically faster on large files.
+    """
+    pivots = {}
+    for col in cols:
+        parts = []
+        for mo, dm in zip(all_months, df_list):
+            if oc not in dm.columns or sc not in dm.columns:
+                continue
+            ac = resolve_col(dm, col)
+            if not ac or ac not in dm.columns:
+                continue
+            tmp = dm[[oc, sc, ac]].copy()
+            tmp['_bc'] = tmp[oc].astype(str).str.strip() + tmp[sc].astype(str).str.strip()
+            tmp['_mo'] = mo
+            tmp['_val'] = pd.to_numeric(tmp[ac], errors='coerce')
+            parts.append(tmp[['_bc', '_mo', '_val']])
+        if not parts:
+            continue
+        all_data = pd.concat(parts, ignore_index=True)
+        pivot = all_data.pivot_table(index='_bc', columns='_mo', values='_val', aggfunc='first')
+        pivots[col] = pivot
+    return pivots
+
+
 def apply_new_baseline_check(final_df, df_list, all_months, resolved, stock_purchase_cols):
     if final_df.empty or not stock_purchase_cols: return final_df
     oc, sc = resolved.get('outlet_id'), resolved.get('sku_id')
@@ -411,39 +467,31 @@ def apply_new_baseline_check(final_df, df_list, all_months, resolved, stock_purc
     PF = 'Previous Month Feedback'
     final_df = final_df.copy()
     if PF not in final_df.columns: final_df[PF] = np.nan
-    lookup = {}
-    for mo, dm in zip(all_months, df_list):
-        if oc not in dm.columns or sc not in dm.columns: continue
-        for _, r in dm.iterrows():
-            bc = str(r[oc]).strip()+str(r[sc]).strip()
-            if bc not in lookup: lookup[bc] = {}
-            for col in stock_purchase_cols:
-                ac = resolve_col(dm, col)
-                if ac and ac in r.index:
-                    val = pd.to_numeric(r[ac], errors='coerce')
-                    if col not in lookup[bc]: lookup[bc][col] = {}
-                    lookup[bc][col][mo] = val
+
+    # Build pivots once using vectorized operations (replaces nested iterrows loop)
+    pivots = _build_metric_pivot(df_list, all_months, oc, sc, stock_purchase_cols)
+    norm_map = {normalize(col): col for col in stock_purchase_cols}
+
     count = 0
     for idx, row in final_df.iterrows():
         if pd.notna(row.get(PF)): continue
-        qs = str(row.get('Queries',''))
+        qs = str(row.get('Queries', ''))
         if oc and sc and oc in row.index and sc in row.index:
-            bc = str(row[oc]).strip()+str(row[sc]).strip()
+            bc = str(row[oc]).strip() + str(row[sc]).strip()
         else:
-            bc = str(row.get('Comb','')).strip()
-        if bc not in lookup: continue
+            bc = str(row.get('Comb', '')).strip()
         reasons = []
         for metric in [m.strip() for m in qs.split(',') if m.strip()]:
-            if metric not in stock_purchase_cols:
-                if not any(normalize(metric)==normalize(s) for s in stock_purchase_cols):
-                    continue
-            md = lookup[bc].get(metric, {})
-            if not md:
-                for s, d in lookup[bc].items():
-                    if normalize(s)==normalize(metric): md=d; break
-            curr_v = md.get(curr_m)
-            prev_v = md.get(prev_m)
-            hist_v = [md[m] for m in all_months[:-2] if m in md]
+            col_key = metric if metric in pivots else norm_map.get(normalize(metric))
+            if not col_key or col_key not in pivots:
+                continue
+            pivot = pivots[col_key]
+            if bc not in pivot.index:
+                continue
+            row_data = pivot.loc[bc]
+            curr_v = row_data.get(curr_m)
+            prev_v = row_data.get(prev_m)
+            hist_v = [row_data.get(m) for m in all_months[:-2] if m in row_data.index]
             ok, reason = _is_new_baseline(curr_v, prev_v, hist_v, metric)
             if ok: reasons.append(reason)
         if reasons:
@@ -506,42 +554,38 @@ def apply_spike_and_return_check(final_df, df_list, all_months, resolved,
     PF = 'Previous Month Feedback'
     final_df = final_df.copy()
     if PF not in final_df.columns: final_df[PF] = np.nan
-    lookup = {}
-    for mo, dm in zip(all_months, df_list):
-        if oc not in dm.columns or sc not in dm.columns: continue
-        for _, r in dm.iterrows():
-            bc = str(r[oc]).strip()+str(r[sc]).strip()
-            if bc not in lookup: lookup[bc] = {}
-            for col in all_metric_cols:
-                ac = resolve_col(dm, col)
-                if ac and ac in r.index:
-                    val = pd.to_numeric(r[ac], errors='coerce')
-                    if col not in lookup[bc]: lookup[bc][col] = {}
-                    lookup[bc][col][mo] = val
+
+    # Build pivots once using vectorized operations (replaces nested iterrows loop)
+    pivots = _build_metric_pivot(df_list, all_months, oc, sc, all_metric_cols)
+    norm_map = {normalize(col): col for col in all_metric_cols}
     price_set = set(price_cols)
+    price_norm_set = {normalize(p) for p in price_cols}
+    skip_metrics = {'Negative sales', 'Negative Profit', 'No Profit', 'Facings exceeds unit stock'}
+
     count = 0
     for idx, row in final_df.iterrows():
         if pd.notna(row.get(PF)): continue
-        qs = str(row.get('Queries',''))
+        qs = str(row.get('Queries', ''))
         if oc and sc and oc in row.index and sc in row.index:
-            bc = str(row[oc]).strip()+str(row[sc]).strip()
+            bc = str(row[oc]).strip() + str(row[sc]).strip()
         else:
-            bc = str(row.get('Comb','')).strip()
-        if bc not in lookup: continue
+            bc = str(row.get('Comb', '')).strip()
         reasons = []
         for metric in [m.strip() for m in qs.split(',') if m.strip()]:
-            if metric in ('Negative sales','Negative Profit','No Profit',
-                          'Facings exceeds unit stock'):
+            if metric in skip_metrics:
                 continue
-            md = lookup[bc].get(metric, {})
-            if not md:
-                for mc, d in lookup[bc].items():
-                    if normalize(mc)==normalize(metric): md=d; break
-            if not md: continue
-            curr_v = md.get(curr_m)
-            is_pc = metric in price_set or any(normalize(metric)==normalize(p) for p in price_set)
+            col_key = metric if metric in pivots else norm_map.get(normalize(metric))
+            if not col_key or col_key not in pivots:
+                continue
+            pivot = pivots[col_key]
+            if bc not in pivot.index:
+                continue
+            row_data = pivot.loc[bc]
+            month_data = {m: row_data.get(m) for m in all_months if m in row_data.index}
+            curr_v = month_data.get(curr_m)
+            is_pc = metric in price_set or normalize(metric) in price_norm_set
             if not is_valid_metric_value(curr_v, is_price=is_pc): continue
-            ok, reason = _is_spike_and_return(curr_v, md, curr_m, metric, is_price=is_pc)
+            ok, reason = _is_spike_and_return(curr_v, month_data, curr_m, metric, is_price=is_pc)
             if ok: reasons.append(reason)
         if reasons:
             final_df.at[idx, PF] = ' | '.join(reasons)
@@ -966,32 +1010,55 @@ def build_comb_rows(comb_results, df_list, all_months, current_month,
     merged['Queries']     = merged.apply(_bq, axis=1)
     merged                = merged[merged['Queries']!='']
     merged['Combination'] = 'Comb'
-    comb_to_row = {}
+
+    # Build comb_to_row lookup using vectorized concat + drop_duplicates
+    # instead of nested iterrows over all sheets (was the main bottleneck)
+    all_parts = []
     for df in reversed(df_list):
-        if comb_field not in df.columns: continue
-        for _,row in df.iterrows():
-            k = str(row[comb_field])
-            if k not in comb_to_row: comb_to_row[k] = row.to_dict()
+        if comb_field not in df.columns:
+            continue
+        all_parts.append(df.copy())
+    if all_parts:
+        combined_lookup = pd.concat(all_parts, ignore_index=True)
+        combined_lookup[comb_field] = combined_lookup[comb_field].astype(str)
+        combined_lookup = combined_lookup.drop_duplicates(subset=[comb_field], keep='first')
+        comb_to_row = combined_lookup.set_index(comb_field).to_dict(orient='index')
+    else:
+        comb_to_row = {}
+
+    # Build per-column month-value lookups vectorized
+    col_month_lookup = {}
+    for col in columns_to_check:
+        col_month_lookup[col] = {}
+        for mo, dm in zip(all_months, df_list):
+            if comb_field not in dm.columns:
+                continue
+            actual = resolve_col(dm, col)
+            if not actual or actual not in dm.columns:
+                continue
+            tmp = dm[[comb_field, actual]].copy()
+            tmp[comb_field] = tmp[comb_field].astype(str)
+            tmp = tmp.drop_duplicates(subset=[comb_field])
+            col_month_lookup[col][mo] = tmp.set_index(comb_field)[actual].to_dict()
+
     final_rows = []
     for _, row in merged.iterrows():
-        cp = row[comb_field]
-        fr = comb_to_row.get(str(cp))
+        cp = str(row[comb_field])
+        fr = comb_to_row.get(cp)
         if fr is None: continue
         fr = dict(fr)
-        fr['Comb']        = str(cp)
+        fr['Comb']        = cp
         fr['Queries']     = row['Queries']
         fr['Combination'] = row['Combination']
         flagged = [c.strip() for c in row['Queries'].split(', ')]
         if 'Negative sales' in flagged:
-            fr['Sales'] = sales_dict.get(str(cp), np.nan)
+            fr['Sales'] = sales_dict.get(cp, np.nan)
         for col in flagged:
-            actual = resolve_col(df_list[-1], col)
-            if not actual: continue
-            for mo, dm in zip(all_months, df_list):
-                if comb_field not in dm.columns: continue
-                mm = dm[dm[comb_field].astype(str)==str(cp)]
-                if not mm.empty and actual in mm.columns:
-                    fr[f'{col} ({mo})'] = mm.iloc[0][actual]
+            mo_lookup = col_month_lookup.get(col, {})
+            for mo, val_dict in mo_lookup.items():
+                val = val_dict.get(cp)
+                if val is not None:
+                    fr[f'{col} ({mo})'] = val
         final_rows.append(fr)
     return final_rows
 
